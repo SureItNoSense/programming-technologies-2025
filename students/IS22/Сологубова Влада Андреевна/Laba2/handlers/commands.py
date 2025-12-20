@@ -18,6 +18,6 @@ async def command_start_handler(message: Message) -> None:
 async def reset_context_handler(message: Message):
     user_id = message.from_user.id
 
-    update_reset(user_id)
+    await update_reset(user_id)
 
     await message.answer("Контекст диалога сброшен! Начинаем диалог заново.")

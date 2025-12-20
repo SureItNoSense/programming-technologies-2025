@@ -159,7 +159,7 @@ async def command_start_handler(message: Message) -> None:
         logging.error(f"Error occurred: {e}")
 ```
 
-Работа чат-бота с системныйм промптом (рис. 3):
+Работа чат-бота с системным промптом (рис. 3):
 
 ![Рисунок 3](pictures/3.png)
 
@@ -190,34 +190,46 @@ async def message_handler(message: Message) -> None:
 
 _Рисунок 4: Обращение по имени к пользователю при ответе_
 
-3. В третьем задании нужно было добавить базу данных, для хранения сообщений. Для этого была создана база данных SQLite messages.db и добавлен файл database.py. В файле database.py было прописано подключение к базе и создание таблицы для хранения данных таких как id, пользовательский id, имя пользователя, его сообщение, ответ чат-бота и время отправки:
+3. В третьем задании нужно было добавить базу данных, для хранения сообщений. Для этого была создана база данных SQLite с использованием асинхронного ORM SQLAlchemy. В файле database.py было реализовано подключение к базе и описана таблица messages для хранения id, пользовательский id, имя пользователя, его сообщение, ответ чат-бота и время отправки:
 
 ```python
-import sqlite3
+from sqlalchemy import Column, Integer, String, Text, DateTime, select, func
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.orm import DeclarativeBase
+from datetime import datetime, timezone
+import asyncio
 
-conn = sqlite3.connect("messages.db")
-cursor = conn.cursor()
+engine = create_async_engine('sqlite+aiosqlite:///messages.db', echo=True)
+async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    message TEXT,
-    response TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
 
-conn.commit()
+class Message(Base):
+    __tablename__ = 'messages'
 
-def save_message(user_id: int, username: str, message: str, response: str):
-    cursor.execute("""
-        INSERT INTO messages (user_id, username, message, response)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, username, message, response))
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer)
+    username = Column(String)
+    message = Column(Text)
+    response = Column(Text)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    conn.commit()
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def save_message(user_id: int, username: str, message: str, response: str):
+    async with async_session() as session:
+        async with session.begin():
+            new_message = Message(
+                user_id=user_id,
+                username=username,
+                message=message,
+                response=response
+            )
+            session.add(new_message)
 ```
 
 Также был изменён файл messages.py, в который была добавлена логика сохранения сообщений в базу данных:
@@ -225,22 +237,23 @@ def save_message(user_id: int, username: str, message: str, response: str):
 ```python
 from utils.loader import dp
 import logging
-from aiogram.types import Message
+from aiogram.types import Message, ContentType
 from utils.gpt import get_response
 from utils.database import save_message
 
 @dp.message()
 async def message_handler(message: Message) -> None:
     try:
-        response = await get_response(message.text)
-        name = message.from_user.first_name
-        save_message(
-            user_id=message.from_user.id,
-            username=name,
-            message=message.text,
-            response=response
-        )
-        await message.answer(f"{name}, {response}")
+
+        user_id = message.from_user.id
+        username = message.from_user.first_name
+        text = message.text
+
+        response = await get_response(user_id, username, text)
+
+        await save_message(user_id, username, text, response)
+
+        await message.answer(f"Вот ваш ответ на вопрос, {username}. {response}")
     except Exception as e:
         logging.error(f"Error occurred: {e}")
         await message.answer("Произошла ошибка при получении ответа от модели")
@@ -259,15 +272,19 @@ _Рисунок 6: Сохранённые сообщения в базе_
 4. Теперь нужно было добавить поддержку контекста диалога, используя уже созданную базу данных. Для этого добавляем в файл database.py функцию get_history, которая берёт историю сообщений из базы данных messages.db:
 
 ```python
-def get_history(user_id: int, limit: int = 3):
-    cursor.execute("""
-        SELECT message, response FROM messages
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (user_id, limit))
+async def get_history(user_id: int, limit: int = 3):
+    last_reset = await get_last_reset(user_id)
+    async with async_session() as session:
+        stmt = select(Message.message, Message.response).where(Message.user_id == user_id)
 
-    return cursor.fetchall()[::-1]
+        if last_reset:
+            stmt = stmt.where(Message.timestamp > last_reset)
+
+        stmt = stmt.order_by(Message.id.desc()).limit(limit)
+        result = await session.execute(stmt)
+        rows = result.fetchall()
+
+        return rows[::-1]
 ```
 
 Далее меняем файл gpt.py по аналогии с прошлой лабораторной работой, чтобы функция get_response учитывала историю диалога, которая хранится в базе:
@@ -275,7 +292,7 @@ def get_history(user_id: int, limit: int = 3):
 ```python
 async def get_response(user_id: int, username: str, user_message: str) -> str:
     try:
-        history = get_history(user_id)
+        history = await get_history(user_id)
 
         prompt = SYSTEM_PROMPT + "\n\nИстория диалога:\n"
 
@@ -298,9 +315,9 @@ async def message_handler(message: Message) -> None:
 
         response = await get_response(user_id, username, text)
 
-        save_message(user_id, username, text, response)
+        await save_message(user_id, username, text, response)
 
-        await message.answer(f"{username}, {response}")
+        await message.answer(f"Вот ваш ответ на вопрос, {username}. {response}")
     except Exception as e:
         logging.error(f"Error occurred: {e}")
         await message.answer("Произошла ошибка при получении ответа от модели")
@@ -315,73 +332,81 @@ _Рисунок 7: Диалог с чат-ботом Telegram с учётом и
 5. В данном задании нужно было добавить команду /reset-context для сброса контекста диалога. Чтобы не удалять ранее сохранённый в базе диалог, было решено фиксировать время последнего сброса в новой таблице и использовать только те сообщения в истории диалога, которые были отправлены после сброса. Для этого добавляем в файл database.py таблицу для хранения времени последнего сброса, также добавляем функции для получения времени последнего сброса и его обновления. Также в функции get_history теперь учитывается сброс контекста:
 
 ```python
-import sqlite3
+from sqlalchemy import Column, Integer, String, Text, DateTime, select, func
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.orm import DeclarativeBase
+from datetime import datetime, timezone
+import asyncio
 
-conn = sqlite3.connect("messages.db")
-cursor = conn.cursor()
+engine = create_async_engine('sqlite+aiosqlite:///messages.db', echo=True)
+async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    message TEXT,
-    response TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS session (
-    user_id INTEGER PRIMARY KEY,
-    last_reset TIMESTAMP
-)
-""")
+class Message(Base):
+    __tablename__ = 'messages'
 
-conn.commit()
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer)
+    username = Column(String)
+    message = Column(Text)
+    response = Column(Text)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-def save_message(user_id: int, username: str, message: str, response: str):
-    cursor.execute("""
-        INSERT INTO messages (user_id, username, message, response)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, username, message, response))
+class Session(Base):
+    __tablename__ = 'session'
 
-    conn.commit()
+    user_id = Column(Integer, primary_key=True)
+    last_reset = Column(DateTime)
 
-def get_last_reset(user_id: int):
-    cursor.execute("""
-        SELECT last_reset FROM session WHERE user_id = ?
-    """, (user_id,))
+async def create_tables():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-    row = cursor.fetchone()
-    return row[0] if row else None
+async def save_message(user_id: int, username: str, message: str, response: str):
+    async with async_session() as session:
+        async with session.begin():
+            new_message = Message(
+                user_id=user_id,
+                username=username,
+                message=message,
+                response=response
+            )
+            session.add(new_message)
 
-def update_reset(user_id: int):
-    cursor.execute("""
-        INSERT OR REPLACE INTO session (user_id, last_reset)
-        VALUES (?, CURRENT_TIMESTAMP)
-    """, (user_id,))
-    conn.commit()
+async def get_last_reset(user_id: int):
+    async with async_session() as session:
+        result = await session.execute(
+            select(Session.last_reset).where(Session.user_id == user_id)
+        )
+        row = result.first()
+        return row[0] if row else None
 
-def get_history(user_id: int, limit: int = 3):
-    last_reset = get_last_reset(user_id)
+async def update_reset(user_id: int):
+    async with async_session() as session:
+        async with session.begin():
+            existing = await session.get(Session, user_id)
 
-    if last_reset:
-        cursor.execute("""
-            SELECT message, response FROM messages
-            WHERE user_id = ? AND timestamp > ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (user_id, last_reset, limit))
-    else:
-        cursor.execute("""
-            SELECT message, response FROM messages
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (user_id, limit))
+            if existing:
+                existing.last_reset = func.now()
+            else:
+                session.add(Session(user_id=user_id, last_reset=func.now()))
 
-    return cursor.fetchall()[::-1]
+async def get_history(user_id: int, limit: int = 3):
+    last_reset = await get_last_reset(user_id)
+    async with async_session() as session:
+        stmt = select(Message.message, Message.response).where(Message.user_id == user_id)
+
+        if last_reset:
+            stmt = stmt.where(Message.timestamp > last_reset)
+
+        stmt = stmt.order_by(Message.id.desc()).limit(limit)
+        result = await session.execute(stmt)
+        rows = result.fetchall()
+
+        return rows[::-1]
 ```
 
 В файл commands.py была добавлена команда reset_context:
@@ -391,7 +416,7 @@ def get_history(user_id: int, limit: int = 3):
 async def reset_context_handler(message: Message):
     user_id = message.from_user.id
 
-    update_reset(user_id)
+    await update_reset(user_id)
 
     await message.answer("Контекст диалога сброшен! Начинаем диалог заново.")
 ```
@@ -426,7 +451,7 @@ async def message_handler(message: Message) -> None:
 
         response = await get_response(user_id, username, text)
 
-        save_message(user_id, username, text, response)
+        await save_message(user_id, username, text, response)
 
         await message.answer(f"Вот ваш ответ на вопрос, {username}. {response}")
     except Exception as e:
@@ -440,4 +465,4 @@ async def message_handler(message: Message) -> None:
 
 _Рисунок 9: Отправка картинки чат-боту Telegram_
 
-Вывод: В ходе выполнения лабораторной работы был успешно реализован простейший чат-бот в Telegram с помощью локальной модели Ollama и библиотеки Aiogram. Были выполнены все задания, а именно: добавлена системная подсказка по аналогии с прошлой лабораторной работой, добавлено обращение к пользователю по имени при ответе, добавлено хранение сообщений в базе данных messages.db, добавлена поддержка контекста диалога, с использованием ранее созданной базы. Также добавлена команда /reset_context, позволяющая, не стирая сохранённую историю, сбросить контекст диалога. И добавлена обработка отправленных картинок с выводом сообщения «Вы отправили картинку!». Все функции чат-бота корректны и работоспособны. Таким образом лабораторная позволила получить навыки создания чат-бота в Telegram, научиться добавлять и редактировать команды для чат-бота, сохранять информацию о пользователе и сообщениях в чате в базе данных и также обрабатывать изображения.
+Вывод: В ходе выполнения лабораторной работы был успешно реализован простейший чат-бот в Telegram с помощью локальной модели Ollama, библиотеки Aiogram и асинхронного ORM SQLAlchemy. Были выполнены все задания, а именно: добавлена системная подсказка по аналогии с прошлой лабораторной работой, добавлено обращение к пользователю по имени при ответе, добавлено хранение сообщений в базе данных SQLite messages.db с использованием ORM SQLAlchemy, добавлена поддержка контекста диалога, с использованием ранее созданной базы. Также добавлена команда /reset_context, позволяющая, не стирая сохранённую историю, сбросить контекст диалога. И добавлена обработка отправленных картинок с выводом сообщения «Вы отправили картинку!». Все функции чат-бота корректны и работоспособны. Таким образом лабораторная позволила получить навыки создания чат-бота в Telegram, работы с асинхронными ORM, добавления и редактирования команд для чат-бота, сохранять информацию о пользователе и сообщениях в чате в базе данных и также обрабатывать изображения.

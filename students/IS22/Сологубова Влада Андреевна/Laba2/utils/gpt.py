@@ -5,7 +5,7 @@ from utils.database import get_history
 
 async def get_response(user_id: int, username: str, user_message: str) -> str:
     try:
-        history = get_history(user_id)
+        history = await get_history(user_id)
 
         prompt = SYSTEM_PROMPT + "\n\nИстория диалога:\n"
 

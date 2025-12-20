@@ -17,7 +17,7 @@ async def message_handler(message: Message) -> None:
 
         response = await get_response(user_id, username, text)
 
-        save_message(user_id, username, text, response)
+        await save_message(user_id, username, text, response)
 
         await message.answer(f"Вот ваш ответ на вопрос, {username}. {response}")
     except Exception as e:
