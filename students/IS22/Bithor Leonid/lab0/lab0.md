@@ -44,7 +44,7 @@
 ```bash
 python server.py
 ```
-был запушен WebUI:
+был запущен WebUI:
 
 ![Рисунок 1](1.png)
 
